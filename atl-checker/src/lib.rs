@@ -12,5 +12,6 @@ pub mod atl;
 mod com;
 mod common;
 pub mod edg;
+pub mod hasher;
 pub mod lcgs;
 mod printer;

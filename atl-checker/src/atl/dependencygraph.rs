@@ -1,6 +1,5 @@
 use crate::common::{Edges, HyperEdge, NegationEdge};
 use crate::edg::{ExtendedDependencyGraph, Vertex};
-use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -8,6 +7,7 @@ use crate::atl::common::{Player, State};
 use crate::atl::formula::Phi;
 use crate::atl::gamestructure::GameStructure;
 use std::fmt::{Display, Formatter};
+use std::hash::BuildHasher;
 
 #[derive(Clone, Debug)]
 pub struct ATLDependencyGraph<G: GameStructure> {
@@ -309,12 +309,14 @@ impl<G: GameStructure> ATLDependencyGraph<G> {
     }
 }
 
-impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph<G> {
-    fn succ(&self, vert: &ATLVertex) -> HashSet<Edges<ATLVertex>, RandomState> {
+impl<G: GameStructure, H: BuildHasher + Clone + Default> ExtendedDependencyGraph<ATLVertex, H>
+    for ATLDependencyGraph<G>
+{
+    fn succ(&self, vert: &ATLVertex) -> HashSet<Edges<ATLVertex>, H> {
         match vert {
             ATLVertex::FULL { state, formula } => match formula.as_ref() {
                 Phi::True => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     // Empty hyper edge
                     edges.insert(Edges::HYPER(HyperEdge {
@@ -326,23 +328,23 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                 }
                 Phi::False => {
                     // No edges
-                    HashSet::new()
+                    HashSet::with_hasher(H::default())
                 }
                 Phi::Proposition(prop) => {
                     let props = self.game_structure.labels(vert.state());
                     if props.contains(prop) {
-                        let mut edges: HashSet<Edges<ATLVertex>> = HashSet::new();
+                        let mut edges = HashSet::with_hasher(H::default());
                         edges.insert(Edges::HYPER(HyperEdge {
                             source: vert.clone(),
                             targets: vec![],
                         }));
                         edges
                     } else {
-                        HashSet::new()
+                        HashSet::with_hasher(H::default())
                     }
                 }
                 Phi::Not(phi) => {
-                    let mut edges: HashSet<Edges<ATLVertex>> = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     edges.insert(Edges::NEGATION(NegationEdge {
                         source: vert.clone(),
@@ -355,7 +357,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     edges
                 }
                 Phi::Or(left, right) => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     edges.insert(Edges::HYPER(HyperEdge {
                         source: vert.clone(),
@@ -376,7 +378,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     edges
                 }
                 Phi::And(left, right) => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
                     let mut targets = vec![];
 
                     targets.push(ATLVertex::FULL {
@@ -396,7 +398,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     edges
                 }
                 Phi::DespiteNext { players, formula } => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     let moves = self.game_structure.move_count(*state);
                     let targets: Vec<ATLVertex> =
@@ -430,14 +432,14 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                                 targets,
                             })
                         })
-                        .collect::<HashSet<Edges<ATLVertex>>>()
+                        .collect::<HashSet<Edges<ATLVertex>, H>>()
                 }
                 Phi::DespiteUntil {
                     players,
                     pre,
                     until,
                 } => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     // `pre`-target
                     // "Is `pre` formula satisfied now?"
@@ -487,7 +489,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     };
 
                     let moves = self.game_structure.move_count(*state);
-                    let mut edges: HashSet<Edges<ATLVertex>> =
+                    let mut edges: HashSet<Edges<ATLVertex>, H> =
                         VarsIterator::new(moves, players.iter().copied().collect())
                             .map(|pmove| {
                                 let mut targets: Vec<ATLVertex> =
@@ -521,7 +523,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     players,
                     formula: subformula,
                 } => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
 
                     // Partial targets with same formula
                     // "Is the formula also satisfied in the next state?"
@@ -558,7 +560,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     // Successor states with same formula
                     // "Is the formula also satisfied in the next state?"
                     let moves = self.game_structure.move_count(*state);
-                    let mut edges: HashSet<Edges<ATLVertex>> =
+                    let mut edges: HashSet<Edges<ATLVertex>, H> =
                         VarsIterator::new(moves, players.iter().copied().collect())
                             .map(|pmove| {
                                 let targets: Vec<ATLVertex> =
@@ -591,7 +593,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     players,
                     formula: subformula,
                 } => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
                     edges.insert(Edges::NEGATION(NegationEdge {
                         source: vert.clone(),
                         target: ATLVertex::FULL {
@@ -609,7 +611,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                     players,
                     formula: subformula,
                 } => {
-                    let mut edges = HashSet::new();
+                    let mut edges = HashSet::with_hasher(H::default());
                     edges.insert(Edges::NEGATION(NegationEdge {
                         source: vert.clone(),
                         target: ATLVertex::FULL {
@@ -639,7 +641,7 @@ impl<G: GameStructure> ExtendedDependencyGraph<ATLVertex> for ATLDependencyGraph
                         targets,
                     })
                 })
-                .collect::<HashSet<Edges<ATLVertex>>>(),
+                .collect::<HashSet<Edges<ATLVertex>, H>>(),
         }
     }
 }

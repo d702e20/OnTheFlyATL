@@ -1,8 +1,7 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::fmt::Display;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::thread;
 
@@ -12,6 +11,7 @@ use crate::com::{Broker, ChannelBroker};
 use crate::common::{
     Edges, HyperEdge, Message, MsgToken, NegationEdge, Token, VertexAssignment, WorkerId,
 };
+use crate::hasher::EdgHasher;
 use std::cmp::max;
 use std::thread::sleep;
 use std::time::Duration;
@@ -21,16 +21,28 @@ use tracing::{span, trace, Level};
 
 pub trait Vertex: Hash + Eq + PartialEq + Clone + Display + Debug {}
 
-pub trait ExtendedDependencyGraph<V: Vertex> {
+pub trait ExtendedDependencyGraph<V: Vertex, H: BuildHasher + Clone + Default = EdgHasher> {
     /// Return out going edges from `vertex`.
     /// This will be cached on each worker.
-    fn succ(&self, vertex: &V) -> HashSet<Edges<V>>;
+    fn succ(&self, vertex: &V) -> HashSet<Edges<V>, H>;
 }
 
 #[instrument]
 pub fn distributed_certain_zero<
-    G: ExtendedDependencyGraph<V> + Send + Sync + Clone + Debug + 'static,
+    G: ExtendedDependencyGraph<V, EdgHasher> + Send + Sync + Clone + Debug + 'static,
     V: Vertex + Send + Sync + 'static,
+>(
+    edg: G,
+    v0: V,
+    worker_count: u64,
+) -> VertexAssignment {
+    distributed_certain_zero_with_hasher::<_, _, EdgHasher>(edg, v0, worker_count)
+}
+
+pub fn distributed_certain_zero_with_hasher<
+    G: ExtendedDependencyGraph<V, H> + Send + Sync + Clone + Debug + 'static,
+    V: Vertex + Send + Sync + 'static,
+    H: BuildHasher + Clone + Default,
 >(
     edg: G,
     v0: V,
@@ -42,21 +54,16 @@ pub fn distributed_certain_zero<
     // TODO make `Broker` responsible for concurrency, and remove the `Arc` wrapper
     let broker = Arc::new(broker);
 
-    for i in (0..worker_count).rev() {
-        let msg_rx = msg_rxs.pop().unwrap();
-        let mut worker = Worker::new(
-            i,
-            worker_count,
-            v0.clone(),
-            msg_rx,
-            broker.clone(),
-            edg.clone(),
-        );
+    msg_rxs.drain(..).enumerate().for_each(|(i, msg_rx)| {
+        let edg = edg.clone();
+        let broker = broker.clone();
+        let v0 = v0.clone();
         thread::spawn(move || {
+            let mut worker = Worker::new(i as u64, worker_count, v0, msg_rx, broker, edg);
             trace!("worker thread start");
             worker.run();
         });
-    }
+    });
 
     let assignment = result_rx
         .recv()
@@ -67,7 +74,12 @@ pub fn distributed_certain_zero<
 }
 
 #[derive(Debug)]
-struct Worker<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V>, V: Vertex> {
+struct Worker<
+    B: Broker<V> + Debug,
+    G: ExtendedDependencyGraph<V, H>,
+    V: Vertex,
+    H: BuildHasher + Clone + Default = EdgHasher,
+> {
     id: WorkerId,
     /// Number of workers working on solving the query. This is used as part of the static allocation scheme, see `crate::Worker::vertex_owner`.
     worker_count: u64,
@@ -77,13 +89,13 @@ struct Worker<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V>, V: Vertex> {
     running: bool,
     /// Greatest known assignment for vertices.
     /// Order is as follow UNEXPLORED/None < UNDECIDED < {TRUE, FALSE}. Once a vertex has been assigned TRUE or FALSE it will never change assignment.
-    assignment: HashMap<V, VertexAssignment>,
-    depends: HashMap<V, HashSet<Edges<V>>>,
+    assignment: HashMap<V, VertexAssignment, H>,
+    depends: HashMap<V, HashSet<Edges<V>, H>, H>,
     /// Map of workers that need to be sent a message once the final assignment of a vertex is known.
-    interests: HashMap<V, HashSet<WorkerId>>,
+    interests: HashMap<V, HashSet<WorkerId, H>, H>,
     /// Greatest number of negation edges in any path from v0 to the given vertex.
     /// Example: If there exists a path from v0 to a vertex, which contains two negation edges, then depth will be two (or more if there is a path with more negation edges).
-    depth: HashMap<V, u32>,
+    depth: HashMap<V, u32, H>,
     msg_rx: Receiver<Message<V>>,
     msg_queue: VecDeque<Message<V>>,
     hyper_queue: VecDeque<HyperEdge<V>>,
@@ -94,7 +106,7 @@ struct Worker<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V>, V: Vertex> {
     /// The logic of handling which edges have been deleted from a vertex is delegated to Worker instead of having to be duplicated in every implementation of ExtendedDependencyGraph.
     /// The first time succ is called on a vertex the call goes to the ExtendedDependencyGraph implementation, and the result is saved in successors.
     /// In all subsequent calls the vertex edges will be taken from the HashMap. This allows for modification of the output of the succ function.
-    successors: HashMap<V, HashSet<Edges<V>>>,
+    successors: HashMap<V, HashSet<Edges<V>, H>, H>,
     edg: G,
     /// Used on the leader as a gate to avoid starting a round of the token ring if one is already in progress.
     token_in_circulation: bool,
@@ -103,15 +115,22 @@ struct Worker<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V>, V: Vertex> {
     dirty: bool,
 }
 
-impl<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V> + Send + Sync + Debug, V: Vertex>
-    Worker<B, G, V>
+impl<
+        B: Broker<V> + Debug,
+        G: ExtendedDependencyGraph<V, H> + Send + Sync + Debug,
+        V: Vertex,
+        H: BuildHasher + Clone + Default,
+    > Worker<B, G, V, H>
 {
     /// Determines which worker instance is responsible for computing the value of the vertex.
     /// Vertices are allocated to workers using a static allocation scheme. Dynamic addition and removal of workers isn't supported with this method.
     fn vertex_owner(&self, vertex: &V) -> WorkerId {
         // Static allocation of vertices to workers
-        let mut hasher = DefaultHasher::new();
-        vertex.hash::<DefaultHasher>(&mut hasher);
+
+        // BUG: H does not hash to the same value across all workers
+        //let mut hasher = H::default().build_hasher();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        vertex.hash(&mut hasher);
         let hash = hasher.finish();
         hash % self.worker_count
     }
@@ -143,17 +162,17 @@ impl<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V> + Send + Sync + Debug, 
             worker_count,
             v0,
             running: true,
-            assignment: HashMap::new(),
-            depends: HashMap::<V, HashSet<Edges<V>>>::new(),
-            interests: HashMap::<V, HashSet<WorkerId>>::new(),
+            assignment: HashMap::with_hasher(H::default()),
+            depends: HashMap::<V, HashSet<Edges<V>, H>, H>::with_hasher(H::default()),
+            interests: HashMap::<V, HashSet<WorkerId, H>, H>::with_hasher(H::default()),
             msg_rx,
             msg_queue: VecDeque::new(),
             hyper_queue: VecDeque::new(),
             negation_queue: VecDeque::new(),
             unsafe_neg_edges: Vec::<Vec<NegationEdge<V>>>::new(),
-            depth: HashMap::<V, u32>::new(),
+            depth: HashMap::<V, u32, H>::with_hasher(H::default()),
             broker,
-            successors: HashMap::<V, HashSet<Edges<V>>>::new(),
+            successors: HashMap::<V, HashSet<Edges<V>, H>, H>::with_hasher(H::default()),
             edg,
             token_in_circulation: false,
             dirty: false,
@@ -426,7 +445,7 @@ impl<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V> + Send + Sync + Debug, 
             set.insert(worker);
         } else {
             trace!(is_initialized = false, ?vertex, "mark vertex interest");
-            let mut set = HashSet::new();
+            let mut set = HashSet::with_hasher(H::default());
             set.insert(worker);
             self.interests.insert(vertex.clone(), set);
         }
@@ -748,13 +767,13 @@ impl<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V> + Send + Sync + Debug, 
 
     /// Wraps the ExtendedDependencyGraph::succ(v) with caching allowing edges to be deleted.
     /// See documentation for the `successors` field.
-    fn succ(&mut self, vertex: &V) -> HashSet<Edges<V>> {
+    fn succ(&mut self, vertex: &V) -> HashSet<Edges<V>, H> {
         if let Some(successors) = self.successors.get(vertex) {
             debug!(?vertex, ?successors, known_vertex = true, "edg::succ");
             #[cfg(feature = "use-counts")]
             eprintln!("worker succ cached");
             // List of successors is already allocated for the vertex
-            successors.clone()
+            successors.to_owned()
         } else {
             // Setup the successors list the first time it is requested
             let successors = self.edg.succ(vertex);
@@ -774,14 +793,13 @@ impl<B: Broker<V> + Debug, G: ExtendedDependencyGraph<V> + Send + Sync + Debug, 
 
 #[cfg(test)]
 mod test {
-    use std::collections::hash_map::RandomState;
     use std::collections::HashSet;
     use std::fmt::Display;
     use test_env_log::test;
 
     use core::fmt::Formatter;
 
-    use crate::common::{Edges, HyperEdge, NegationEdge, VertexAssignment};
+    use crate::common::{Edges, HyperEdge, NegationEdge};
     use crate::edg::{distributed_certain_zero, ExtendedDependencyGraph, Vertex};
 
     #[test]
